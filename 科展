@@ -1,0 +1,310 @@
+#==============================
+# A. XGBoost 分析
+#==============================
+
+#==============================
+# 1. 安裝並載入必要的套件
+#==============================
+packageName <- c("xgboost", "Matrix", "caret", "data.table", "dplyr","ICEbox")
+for (i in 1:length(packageName)) {
+  if (!(packageName[i] %in% rownames(installed.packages()))) {
+    install.packages(packageName[i])
+  }
+}
+library(xgboost)
+library(Matrix)
+library(caret)
+library(data.table)
+library(dplyr)
+library(ICEbox)
+
+
+#==============================
+# 2. 讀取並處理原始數據集
+#==============================
+# 讀取原始數據集
+setwd("C:/慈濟/Week4")  # 設定工作目錄
+data <- read.csv("StudentPerformanceFactors.csv", header = TRUE)
+
+# 檢查數據結構
+str(data)
+
+# 將所有 character 型和 factor 型變數轉換為因子
+data <- data %>%
+  mutate(across(where(is.character), as.factor))  # 將所有文字型資料轉為因子型
+
+#==============================
+# 3. 使用 dummyVars 進行 One-Hot 編碼
+#==============================
+# 使用 caret 的 dummyVars 進行 One-Hot 編碼，設置 fullRank = FALSE 來保留所有類別
+dummy_model <- dummyVars(~ ., data = data, fullRank = FALSE)
+data_one_hot <- predict(dummy_model, newdata = data)
+
+# 檢查 One-Hot 編碼後的結果
+str(data_one_hot)  # 應該包含所有類別的編碼
+
+#==============================
+# 4. 提取應變數與特徵變數
+#==============================
+# 假設最後一列為應變數，其他為特徵變數
+target_index <- ncol(data_one_hot)
+target <- data_one_hot[, target_index]
+features <- data_one_hot[, -target_index]
+
+# 檢查應變數與特徵變數
+str(features)
+str(target)
+
+#==============================
+# 5. 訓練集和測試集分割
+#==============================
+set.seed(123)
+trainIndex <- createDataPartition(target, p = 0.8, list = FALSE)
+
+# 分割訓練集和測試集
+trainData <- features[trainIndex, ]
+testData <- features[-trainIndex, ]
+print(colnames(trainData))
+# 提取訓練集和測試集的標籤
+trainLabel <- target[trainIndex]
+testLabel <- target[-trainIndex]
+
+write.csv(trainData,file ="訓練集.csv")
+write.csv(testData,file ="測試集.csv")
+
+
+#==============================
+# 6. 交叉驗證設定
+#==============================
+# 使用 caret 進行交叉驗證來選擇最佳參數
+# 5 折交叉驗證 在交叉驗證中（如 5 折交叉驗證），
+# 每次劃分訓練集和驗證集，計算每次的 RMSE，然後求取平均值。
+
+train_control <- trainControl(method = "cv", number = 5)  
+
+
+# 定義調參範圍
+tune_grid <- expand.grid(
+  nrounds = c(50, 100, 150),   # 樹的輪數 : 建議範圍：100 到 1000
+  max_depth = c(3, 6, 9),      # 樹的深度: 建議範圍：3 到 10。
+  eta = c(0.01, 0.1, 0.3),     # 學習率
+  gamma = 0,                   # 分裂節點的最小損失函數減少: c(0, 1, 5)
+  colsample_bytree = 1,        # 每棵樹隨機選取的特徵比例: c(0.5, 0.8, 1)
+  min_child_weight = 1,        # 最小葉子節點權重和: c(1, 5, 10)
+  subsample = 1                # 每棵樹的樣本比例: c(0.5, 0.8, 1) 。較大的值（如 1）代表使用所有樣本
+)
+
+# 使用 caret 的 train 進行交叉驗證
+set.seed(123)
+xgb_cv <- train(
+  x = trainData,
+  y = trainLabel,
+  method = "xgbTree",
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  metric = "RMSE"  # 使用 RMSE 作為評估標準
+)
+
+# 顯示最佳參數和平均驗證集 RMSE
+# print(xgb_cv$results)
+# print(paste("Average Valid RMSE:", mean(xgb_cv$results$RMSE)))
+
+
+#==============================
+# 7. 使用最佳參數訓練模型
+#==============================
+# 使用最佳參數設置進行模型訓練
+best_params <- list(
+  objective = "reg:squarederror",  # 迴歸目標
+  eval_metric = "rmse",            # 評估指標
+  eta = xgb_cv$bestTune$eta,       # 最佳學習率
+  max_depth = xgb_cv$bestTune$max_depth,  # 最佳深度
+  subsample = xgb_cv$bestTune$subsample,  # 最佳子樣本比例
+  colsample_bytree = xgb_cv$bestTune$colsample_bytree  # 最佳特徵比例
+)
+
+# 訓練最終模型
+xgbModel <- xgb.train(
+  params = best_params,
+  data = xgb.DMatrix(data = trainData, label = trainLabel),
+  nrounds = xgb_cv$bestTune$nrounds
+)
+
+
+
+#==============================
+# 8. 使用測試集進行預測與評估
+#==============================
+# 使用測試集進行預測
+pred <- predict(xgbModel, xgb.DMatrix(data = testData))
+
+result <- cbind(testData,testLabel, pred)
+write.csv(result,file ="顯示結果_測試集vs預測.csv")
+
+# 計算預測 RMSE
+rmse <- sqrt(mean((pred - testLabel) ^ 2))
+cat("測試集 RMSE:", rmse, "\n")
+
+# 手動計算 R²
+r2_manual <- 1 - sum((testLabel - pred)^2) / sum((testLabel - mean(testLabel))^2)
+cat("Manual R-Squared (R²):", r2_manual, "\n")
+
+#==============================
+# 9. 儲存模型及變數名稱
+#==============================
+# 儲存模型
+xgb.save(xgbModel, "xgb_student_performance_regression_model.model")
+
+# 儲存變數名稱以便與新測試集對應
+feature_info <- data.frame(feature_name = colnames(features))
+write.csv(feature_info, "training_feature_info.csv", row.names = FALSE)
+
+#==============================
+# 10. 特徵重要性分析
+#==============================
+# 獲取特徵重要性
+importance_matrix <- xgb.importance(feature_names = colnames(trainData), model = xgbModel)
+
+# 顯示特徵重要性
+print(importance_matrix)
+
+# 繪製特徵重要性圖
+xgb.plot.importance(importance_matrix)
+
+# 保存特徵重要性到 CSV 檔案
+write.csv(importance_matrix, file = "xgb_feature_importance_student_performance.csv", row.names = FALSE)
+
+##############################################
+# 使用訓練好的模型對新測試集進行預處理和預測 #
+##############################################
+
+#==============================
+# 1. 讀取訓練好的模型和變數信息
+#==============================
+# 載入訓練好的模型
+model_path <- "xgb_student_performance_regression_model.model"
+xgbModel <- xgb.load(model_path)
+
+# 讀取變數名稱信息
+feature_info <- read.csv("training_feature_info.csv")
+feature_names <- feature_info$feature_name
+
+#==============================
+# 2. 讀取新測試集並預處理
+#==============================
+# 讀取新測試集
+new_test_data <- read.csv("新測試集.csv", header = TRUE)
+
+# 檢查變數的層次數量，確保每個變數至少有兩個層次
+for (col in colnames(new_test_data)) {
+  if (is.factor(new_test_data[[col]]) | is.character(new_test_data[[col]])) {
+    # 檢查層次數量
+    levels_count <- length(unique(new_test_data[[col]]))
+    if (levels_count < 2) {
+      # 為只有一個層次的變數添加另一個層次
+      new_test_data[[col]] <- factor(new_test_data[[col]], levels = c(unique(new_test_data[[col]]), "Other"))
+    }
+  }
+}
+
+# 使用 dummyVars 進行 One-Hot 編碼
+dummy_model_new <- dummyVars(~ ., data = new_test_data, fullRank = FALSE)
+new_test_data_encoded <- predict(dummy_model_new, newdata = new_test_data)
+
+# 檢查 new_test_data_encoded 是否為數據框格式
+if (!is.data.frame(new_test_data_encoded)) {
+  new_test_data_encoded <- as.data.frame(new_test_data_encoded)
+}
+
+# 檢查 new_test_data_encoded 的結構和列數
+cat("New Test Data Encoded Structure:\n")
+#str(new_test_data_encoded)
+cat("Column Count of Encoded Data:", ncol(new_test_data_encoded), "\n")
+
+# 確保新測試集的列順序與訓練集一致
+missing_vars <- setdiff(feature_names, colnames(new_test_data_encoded))
+if (length(missing_vars) > 0) {
+  for (var in missing_vars) {
+    new_test_data_encoded[[var]] <- 0  # 添加缺失的變數列並賦值為 0
+  }
+}
+
+# 確保新測試集包含所有訓練集變數
+extra_vars <- setdiff(colnames(new_test_data_encoded), feature_names)
+if (length(extra_vars) > 0) {
+  new_test_data_encoded <- new_test_data_encoded[, feature_names]
+}
+
+# 檢查處理後的 new_test_data_encoded 結構
+cat("Processed Test Data Encoded Structure:\n")
+#str(new_test_data_encoded)
+
+#==============================
+# 3. 使用訓練好的模型進行預測
+#==============================
+# 使用模型對新測試集進行預測
+dtest_new <- xgb.DMatrix(data = as.matrix(new_test_data_encoded))
+new_predictions <- predict(xgbModel, dtest_new)
+
+# 將預測結果加入到新測試集中
+new_test_data$Predicted_Result <- new_predictions
+
+#==============================
+# 4. 保存預測結果
+#==============================
+# 保存預測結果至 CSV 文件
+write.csv(new_test_data, "新測試集_預測結果.csv", row.names = FALSE)
+
+
+##################################
+#  顯示最後模型分析的效果        #
+##################################
+
+###  計算 R² （判定係數）: 衡量模型對於總變異的解釋能力，越接近 1 表示模型解釋能力越強。
+r2_manual <- 1 - sum((testLabel - pred)^2) / sum((testLabel - mean(testLabel))^2)
+cat("Manual R-Squared (R²):", r2_manual, "\n")
+r2_rounded <- round(r2_manual, 4)
+# 實際值與預測值的關係圖
+plot(testLabel, pred, main =paste( "分析測試集：實際分數 vs. 預測分數",", R²=",r2_rounded), xlab = "實際分數", ylab = "預測分數")
+abline(0, 1, col = "red",lwd=2)
+
+
+
+### ICE（Individual Conditional Expectation）個別條件期望圖用來展示某一特徵在不同取值時，對個體預測結果的影響。
+
+# 構建 DMatrix 格式數據
+trainMatrix <- as.matrix(trainData) # 去掉目標變數列
+dtrain <- xgb.DMatrix(data = trainMatrix, label = trainLabel)
+
+
+# 提取特徵重要性
+importance_matrix <- xgb.importance(feature_names = colnames(trainMatrix), model = xgbModel)
+
+# 查看特徵重要性排名前 5 的特徵
+top_features <- head(importance_matrix$Feature, 5)
+print(top_features)
+
+# 設置保存 ICE 圖的目錄
+save_dir <- "ICE_plots"
+if (!dir.exists(save_dir)) dir.create(save_dir)
+
+# 循環繪製並保存每個重要特徵的 ICE 圖
+for (feature in top_features) {
+  # 構建 ICE 物件
+  ice_obj <- ice(object = xgbModel, X = trainMatrix, y = trainLabel, predictor = feature)
+  
+  # 設置保存路徑和文件名
+  file_name <- file.path(save_dir, paste0("ICE_Plot_", feature, ".png"))
+  
+  # 打開 PNG 圖形設備
+  png(filename = file_name, width = 800, height = 600)
+  
+  # 繪製 ICE 圖
+  plot(ice_obj, main = paste("ICE Plot for", feature))
+  
+  # 關閉圖形設備，保存文件
+  dev.off()
+  
+  cat("Saved ICE plot for", feature, "to", file_name, "\n")
+}
+
